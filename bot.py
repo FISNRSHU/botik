@@ -5,15 +5,12 @@ import logging
 import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler, CallbackQueryHandler, ConversationHandler
 from better_profanity import profanity
 from keep_alive import keep_alive
 
 # ========== ЗАВАНТАЖЕННЯ ЗМІННИХ ==========
-load_dotenv()
-
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задано в .env")
