@@ -8,34 +8,30 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler, CallbackQueryHandler, ConversationHandler
-from profanity_filter import ProfanityFilter
+from better_profanity import profanity
+from keep_alive import keep_alive
 
+# ========== ЗАВАНТАЖЕННЯ ЗМІННИХ ==========
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задано в .env")
+
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 admin_ids_str = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
 
+# ========== НАЛАШТУВАННЯ ЛОГУВАННЯ ==========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CHOOSING_ACTION, CHOOSING_TYPE, PRIVACY, TYPING = range(4)   # Без BROADCAST
+# ========== СТАНИ ДЛЯ ДІАЛОГУ ==========
+CHOOSING_ACTION, CHOOSING_TYPE, PRIVACY, TYPING = range(4)
 
-# --- База даних ---
+# ========== БАЗА ДАНИХ ==========
 conn = sqlite3.connect("tickets.db", check_same_thread=False)
 cursor = conn.cursor()
-
-# Таблиця tickets
-cursor.execute("PRAGMA table_info(tickets)")
-columns = [col[1] for col in cursor.fetchall()]
-if "last_updated" not in columns:
-    cursor.execute("ALTER TABLE tickets ADD COLUMN last_updated TIMESTAMP")
-if "taken_by" not in columns:
-    cursor.execute("ALTER TABLE tickets ADD COLUMN taken_by TEXT DEFAULT NULL")
-conn.commit()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS tickets (
@@ -53,7 +49,14 @@ CREATE TABLE IF NOT EXISTS tickets (
 """)
 conn.commit()
 
-# Таблиця replies (історія відповідей)
+cursor.execute("PRAGMA table_info(tickets)")
+columns = [col[1] for col in cursor.fetchall()]
+if "last_updated" not in columns:
+    cursor.execute("ALTER TABLE tickets ADD COLUMN last_updated TIMESTAMP")
+if "taken_by" not in columns:
+    cursor.execute("ALTER TABLE tickets ADD COLUMN taken_by TEXT DEFAULT NULL")
+conn.commit()
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +72,7 @@ conn.commit()
 cursor.execute("UPDATE tickets SET last_updated = created_at WHERE last_updated IS NULL")
 conn.commit()
 
-# --- Клавіатури ---
+# ========== КЛАВІАТУРИ ==========
 menu_markup = ReplyKeyboardMarkup([["➕ Нове звернення", "📦 Мої звернення"]], resize_keyboard=True)
 type_markup = ReplyKeyboardMarkup(
     [["💡Пропозиція", "❓Питання"], ["⚠️ Проблема", "◀️ Назад"]],
@@ -80,15 +83,13 @@ privacy_markup = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# --- Пам'ять ---
+# ========== ПАМ'ЯТЬ ==========
 tickets = {}
 admin_reply_state = {}
 user_last_msg = {}
-broadcast_sessions = {}   # {user_id: {"media": [], "caption": ""}}
+broadcast_sessions = {}
 
-# --- Цензура ---
-profanity_filter = ProfanityFilter()
-
+# ========== ДОПОМІЖНІ ФУНКЦІЇ ==========
 def is_spam(uid):
     now = time.time()
     if now - user_last_msg.get(uid, 0) < 5:
@@ -126,12 +127,11 @@ def auto_upgrade_priority(ticket):
             return True
     return False
 
-# ----------------- КОРИСТУВАЦЬКІ ФУНКЦІЇ -----------------
+# ========== ФУНКЦІЇ КОРИСТУВАЧА ==========
 async def show_menu(update: Update):
     await update.message.reply_text("Оберіть дію:", reply_markup=menu_markup)
 
 async def show_my_tickets(update: Update, user_id: int, page: int = 0):
-    """Показує звернення з пагінацією та історією відповідей"""
     limit = 5
     offset = page * limit
     rows = cursor.execute("""
@@ -150,7 +150,6 @@ async def show_my_tickets(update: Update, user_id: int, page: int = 0):
         return
 
     for tid, ttype, status, prio, created in rows:
-        # Отримуємо відповіді
         replies = cursor.execute("""
             SELECT admin_name, reply_text, created_at
             FROM replies
@@ -158,7 +157,6 @@ async def show_my_tickets(update: Update, user_id: int, page: int = 0):
             ORDER BY created_at ASC
         """, (tid,)).fetchall()
         
-        # Текст звернення
         if tid in tickets:
             ticket_text = tickets[tid]['text']
         else:
@@ -182,7 +180,6 @@ async def show_my_tickets(update: Update, user_id: int, page: int = 0):
         
         await update.message.reply_text(text, parse_mode="Markdown")
     
-    # Пагінація
     total_count = cursor.execute("SELECT COUNT(*) FROM tickets WHERE user_id=?", (user_id,)).fetchone()[0]
     if total_count > (page + 1) * limit:
         kb = InlineKeyboardMarkup([[
@@ -191,7 +188,6 @@ async def show_my_tickets(update: Update, user_id: int, page: int = 0):
         await update.message.reply_text("Щоб побачити більше звернень, натисніть кнопку:", reply_markup=kb)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Очищаємо можливий режим розсилки
     user_id = update.message.from_user.id
     if user_id in broadcast_sessions:
         del broadcast_sessions[user_id]
@@ -249,7 +245,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     anon = context.user_data["anon"]
     text = update.message.text
 
-    if profanity_filter.contains_profanity(text):
+    if profanity.contains_profanity(text):
         await update.message.reply_text("❌ Ваше повідомлення містить нецензурну лексику або образи. Будь ласка, переформулюйте звернення ввічливо.")
         return CHOOSING_ACTION
 
@@ -294,10 +290,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Звернення #{tid} збережено.", reply_markup=menu_markup)
     return CHOOSING_ACTION
 
-# ----------------- АДМІН ФУНКЦІЇ -----------------
+# ========== АДМІН ФУНКЦІЇ ==========
 async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
-    if uid not in admin_reply_state:
+    if uid not in ADMIN_IDS or uid not in admin_reply_state:
         return
     tid = admin_reply_state.pop(uid)
     t = tickets.get(tid)
@@ -331,7 +327,7 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     await update.message.reply_text("✅ Відповідь надіслано користувачеві та збережено в історії.")
 
-# ---------- РОЗСИЛКА (без ConversationHandler) ----------
+# ========== РОЗСИЛКА ==========
 def get_all_users():
     cursor.execute("SELECT DISTINCT user_id FROM tickets")
     return [row[0] for row in cursor.fetchall()]
@@ -352,7 +348,6 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово", callback_data="broadcast_finish")]])
     await update.message.reply_text("Коли закінчите – натисніть кнопку:", reply_markup=kb)
 
-# Загальний обробник для тексту, фото, відео (перевіряє, чи користувач у режимі розсилки)
 async def broadcast_collector(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     if user_id not in broadcast_sessions:
@@ -360,7 +355,6 @@ async def broadcast_collector(update: Update, context: ContextTypes.DEFAULT_TYPE
     session = broadcast_sessions[user_id]
     msg = update.message
 
-    # Якщо вже є відео – більше не додаємо
     if any(m["type"] == "video" for m in session["media"]):
         await msg.reply_text("❌ Ви вже додали відео. Натисніть 'Готово' для розсилки.")
         return
@@ -388,19 +382,17 @@ async def broadcast_collector(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     broadcast_sessions[user_id] = session
 
-# ---------- ОСНОВНИЙ CALLBACK ХЕНДЛЕР ----------
+# ========== ОСНОВНИЙ CALLBACK ==========
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    # ----- Пагінація "Мої звернення" -----
     if data.startswith("mytickets_"):
         page = int(data.split("_")[1])
         await show_my_tickets(update, query.from_user.id, page)
         return
 
-    # ----- Скидання статистики -----
     if data.startswith("reset_"):
         user_id = query.from_user.id
         if user_id not in ADMIN_IDS:
@@ -416,7 +408,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Очищення скасовано.")
         return
 
-    # ----- Завершення збору розсилки -----
     if data == "broadcast_finish":
         user_id = query.from_user.id
         if user_id not in broadcast_sessions:
@@ -484,7 +475,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Розсилку скасовано.")
         return
 
-    # ----- Зміна пріоритету -----
     if data.startswith("set_priority_"):
         parts = data.split("_")
         if len(parts) >= 4:
@@ -518,7 +508,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_ticket_details(query, t)
         return
 
-    # ----- Звичайні дії з тикетами -----
     try:
         act, tid_str = data.split("_", 1)
         tid = int(tid_str)
@@ -624,7 +613,7 @@ async def show_ticket_details(query, t):
         text += f"\n👨‍💼 В роботі: {t['taken_by']}"
     await query.edit_message_text(text, reply_markup=kb)
 
-# ----------------- СТАТИСТИКА -----------------
+# ========== СТАТИСТИКА ==========
 async def get_stats_data(since_date: datetime):
     cursor.execute("""
         SELECT type, priority, status, created_at, last_updated
@@ -726,7 +715,7 @@ async def cmd_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ---------- Автоматичні звіти ----------
+# ========== АВТОМАТИЧНІ ЗВІТИ ==========
 last_report_date = {"week": None, "month": None, "year": None}
 
 async def send_scheduled_report(app, period: str):
@@ -763,7 +752,7 @@ async def stats_scheduler(app):
         await send_scheduled_report(app, "year")
         await asyncio.sleep(3600)
 
-# ----------------- ЗАПУСК -----------------
+# ========== ЗАПУСК ==========
 async def test_admin_chat(app):
     try:
         await app.bot.send_chat_action(chat_id=ADMIN_CHAT_ID, action="typing")
@@ -772,6 +761,7 @@ async def test_admin_chat(app):
         logger.error(f"❌ НЕМАЄ ДОСТУПУ: {e}")
 
 def main():
+    keep_alive()
     app = ApplicationBuilder().token(TOKEN).build()
     
     async def combined_post_init(app):
@@ -779,7 +769,7 @@ def main():
         asyncio.create_task(stats_scheduler(app))
     app.post_init = combined_post_init
 
-    # Основний діалог (звернення)
+    # Основний діалог (звернення) - найвищий пріоритет
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -792,16 +782,18 @@ def main():
     )
     app.add_handler(conv)
 
-    # Обробник розсилки (без ConversationHandler) – перевіряє, чи користувач у режимі
-    app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.TEXT) & ~filters.COMMAND, broadcast_collector), group=0)
+    # Адмін відповіді (група 1): Дозволяє відповідати з ЛС
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reply), group=1)
+
+    # Розсилка (група 2): Не заважає звичайним користувачам
+    app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.TEXT) & ~filters.COMMAND, broadcast_collector), group=2)
 
     # Інші обробники
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Chat(ADMIN_CHAT_ID), admin_reply))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("reset_stats", cmd_reset_stats))
-    app.add_handler(CommandHandler("cancel", start))   # /cancel скидає стан
+    app.add_handler(CommandHandler("cancel", start))
 
     app.run_polling()
 
